@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Copy a remote file into the local X11 clipboard."""
+
+import argparse
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Copy a remote file to your local clipboard using SSH and xclip."
+    )
+    parser.add_argument(
+        "-p", "--port", type=int, metavar="PORT",
+        help="SSH port (default: SSH config or 22)",
+    )
+    parser.add_argument("source", metavar="[user@]host:path", help="remote file to copy")
+    args = parser.parse_args()
+    if args.port is not None and not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    host, path = parse_source(parser, args.source)
+    validate_host(parser, host)
+
+    for command in ("ssh", "xclip"):
+        if shutil.which(command) is None:
+            return error(f"install {command} on your local computer first")
+
+    # SSH passes a command string to the remote shell. Quote the path there
+    # too, so spaces, quotes, and shell metacharacters remain literal.
+    ssh_command = ["ssh", "-T"]
+    if args.port is not None:
+        ssh_command.extend(["-p", str(args.port)])
+    remote_path = shlex.quote(path)
+    if path.startswith("~/"):
+        remote_path = '"$HOME"/' + shlex.quote(path[2:])
+    ssh_command.extend(["--", host, "cat < " + remote_path])
+    remote = subprocess.run(
+        ssh_command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+    )
+    if remote.returncode != 0:
+        return error("SSH could not read the remote file; clipboard unchanged")
+
+    # Buffer in memory so a failed SSH transfer cannot replace the clipboard
+    # with partial output. Keep bytes intact, including trailing newlines.
+    copied = subprocess.run(
+        ["xclip", "-selection", "clipboard"],
+        input=remote.stdout,
+        stdout=subprocess.DEVNULL,
+    )
+    if copied.returncode != 0:
+        return error("xclip failed; run sclip from your local graphical desktop")
+    return 0
+
+
+def parse_source(parser, source):
+    # Split host:path while allowing [IPv6]:path and user@[IPv6]:path.
+    match = re.fullmatch(
+        r"(?P<host>(?:[^@:\[\]\s]+@)?\[[^\[\]\s]+\]|[^:\[\]\s]+):(?P<path>.+)",
+        source,
+        re.DOTALL,
+    )
+    if match is None:
+        parser.error("use [user@]host:path, with brackets around IPv6 addresses")
+    host = match.group("host")
+    if host.endswith("]"):
+        prefix, _, address = host.partition("[")
+        host = prefix + address[:-1]
+    return host, match.group("path")
+
+
+def validate_host(parser, host):
+    if not host or host.startswith("-") or any(char.isspace() for char in host):
+        parser.error("use an SSH host or alias, e.g. user@server or myserver")
+
+
+def error(message):
+    print(f"sclip: {message}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, UnicodeError) as exc:
+        sys.exit(error(str(exc)))
+    except KeyboardInterrupt:
+        sys.exit(130)
